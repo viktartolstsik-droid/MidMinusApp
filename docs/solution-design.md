@@ -101,9 +101,11 @@
 - **Responsibility:** Потреблять сообщения из очереди, валидировать, дедуплицировать, записывать в PostgreSQL, уведомлять Notification Service о новых показаниях.
 - **Runtime:** ASP.NET Core Worker / hosted consumer.
 - **Key libraries:** **RabbitMQ.Client** / MassTransit, **EF Core** + Npgsql, **Serilog**, `HttpClient` (вызов Notification).
-- **Resilience / config:** idempotent insert по `(SourceId, IngestedAt)` или аналог; dead-letter / retry policy для poison messages.
+- **Resilience / config:** idempotent insert по `(SourceId, IngestedAt)`; dead-letter / retry policy для poison messages; **RabbitMQ manual ACK** (см. §4.3).
 - **Inputs:** RabbitMQ consume.
 - **Outputs:** SQL INSERT/UPSERT; HTTP POST к Notification (payload «reading persisted»).
+
+**RabbitMQ (кратко):** consumer с `autoAck: false`, `prefetchCount: 1` (или небольшой prefetch). **ACK только после успешного `SaveChanges` в PostgreSQL** (одна транзакция: insert + commit). При transient ошибке (DB timeout) — **NACK + requeue**; после N попыток — reject в **DLQ**. При poison / invalid payload — NACK **без** requeue → DLQ. **Не ACK** между consume и insert: иначе при падении процесса сообщение теряется навсегда.
 
 #### GraphQL API Gateway
 
@@ -144,7 +146,7 @@
 {
   "messageId": "uuid // required, idempotency key for queue tracing",
   "ingestedAt": "datetime // required, UTC, when Ingestor received from WeakApp",
-  "sourceId": "string // required, stable id from WeakApp or hash(payload)",
+  "sourceId": "string // required, см. §4.3 SourceId",
   "location": "string // required",
   "type": "string // required, e.g. energy | motion | temperature",
   "value": "number // required",
@@ -179,13 +181,44 @@
 
 1. Ingestor по таймеру вызывает WeakApp `GET /meters` (Polly: retry/backoff, circuit breaker).
 2. При успехе: нормализация → publish `RawReadingMessage` в RabbitMQ.
-3. Processor consume → validate → dedupe → INSERT в `Readings`.
+3. Processor consume → validate → dedupe → INSERT в `Readings` → **ACK** сообщения в RabbitMQ (§4.3).
 4. Processor вызывает Notification (`ReadingPersistedNotification`).
 5. Notification рассылает `ReadingUpdated` по SignalR подключённым клиентам.
 6. Operator открывает UI → Frontend GraphQL query к Gateway → SELECT из PostgreSQL.
 7. При SignalR event Frontend делает refetch затронутых GraphQL queries (или точечное обновление кэша Apollo).
 
 Sequence-диаграмма: [architecture-c4.md §3 Dynamic](./architecture-c4.md#3-dynamic-sequence).
+
+### 4.3 SourceId и дедупликация
+
+`SourceId` вычисляет **Data Ingestor** при каждой успешной выборке из WeakApp и кладёт в `RawReadingMessage`. Processor не пересчитывает — только сохраняет в `Readings.SourceId` и использует в unique `(SourceId, IngestedAt)`.
+
+**Правило (по приоритету, после первого sample `/meters`):**
+
+1. Если в элементе ответа WeakApp есть стабильное поле идентификатора показания (`id`, `readingId`, …) — **`SourceId` = его строковое значение**.
+2. Иначе, если есть **бизнес-время** показания от API (`timestamp`, `recordedAt`, …) — **`SourceId` = `{location}:{type}:{recordedAtUtc}`** (нормализованные location/type, ISO-8601 UTC).
+3. Иначе — **`SourceId` = base64url(SHA-256)** от канонического JSON объекта `{ location, type, value, unit }` **без** `ingestedAt` (fallback, если API отдаёт только «снимок» без id/времени).
+
+**`IngestedAt`** — всегда UTC-момент, когда Ingestor **получил** этот элемент из HTTP-ответа (не путать с business time из WeakApp). Пара `(SourceId, IngestedAt)`:
+
+- отсекает **повторную доставку** того же AMQP-сообщения (retry Ingestor/Processor, requeue);
+- допускает **новую строку** при следующем poll, если тот же счётчик (`SourceId` по id датчика) пришёл с новым `IngestedAt` и, как правило, новым `value`.
+
+Если после sample окажется, что WeakApp каждый раз отдаёт только текущие значения без id, зафиксируем в SDD вариант 2 или 3 и при необходимости сузим unique до `SourceId` + business timestamp — см. §13.
+
+### 4.4 RabbitMQ: подтверждение доставки (ACK)
+
+| Этап | Поведение |
+|------|-----------|
+| Publish (Ingestor) | Publisher confirm (optional) или persistent messages + durable queue |
+| Consume (Processor) | Manual ack, prefetch ограничен |
+| После validate | Ещё **без ACK** |
+| После INSERT + commit DB | **BasicAck** — сообщение удаляется из unacked |
+| DB / transient failure | **BasicNack(requeue: true)** — повторная дelivery |
+| Invalid schema / poison | **BasicNack(requeue: false)** или reject → **DLQ** `ingestor.raw.dlq` |
+| Crash между consume и commit | Сообщение **не ack** → RabbitMQ redelivers другому consumer / после restart |
+
+Ingestor при publish не удаляет данные из WeakApp — at-least-once на очереди; идempotency на стороне Processor через `(SourceId, IngestedAt)`.
 
 ---
 
@@ -219,10 +252,13 @@ CREATE INDEX idx_readings_ingested_at
 
 Поля `Location`, `Type`, `Value` согласуются с нормализованным контрактом §4.1; при расхождении с WeakApp маппинг обновляется только в Ingestor.
 
+**`SourceId`:** см. §4.3 — задаётся Ingestor, хранится как `VARCHAR(255)`; на него опирается `uq_readings_source_ingested`.
+
 ### 5.2 Aggregation Strategy
 
 - **Latest values:** `ORDER BY IngestedAt DESC` с фильтром по `location` / `type` (индекс `idx_readings_location_type_time`).
-- **Charts / time series:** `date_trunc` (hour/day) + `AVG`/`MAX`/`MIN` по `Value` в GraphQL resolver или EF-запросе.
+- **By location / by type (D3S1):** `GROUP BY Location` или `GROUP BY Type` за `[from, to]` — queries `aggregationsByLocation` / `aggregationsByType` (§6.1).
+- **Charts / time series:** `date_trunc` (hour/day) + `AVG`/`MAX`/`MIN` по `Value` — `aggregationsByTime`.
 - **Pagination:** cursor/keyset по `(IngestedAt, Id)` для стабильных страниц.
 
 Отдельная таблица rollup не планируется на MVP (см. ADR-02 trade-off: простота vs read latency при больших данных).
@@ -259,6 +295,20 @@ type Query {
     type: String
     bucket: TimeBucket = HOUR
   ): [TimeAggregation!]!
+
+  """D3S1: aggregations by location — сводка по каждой location за интервал."""
+  aggregationsByLocation(
+    from: DateTime!
+    to: DateTime!
+    type: String
+  ): [LocationAggregation!]!
+
+  """D3S1: aggregations by type — сводка по каждому type за интервал."""
+  aggregationsByType(
+    from: DateTime!
+    to: DateTime!
+    location: String
+  ): [TypeAggregation!]!
 }
 
 type Reading {
@@ -287,6 +337,26 @@ type TimeAggregation {
   count: Int!
 }
 
+type LocationAggregation {
+  location: String!
+  avg: Float
+  min: Float
+  max: Float
+  count: Int!
+  latestValue: Float
+  latestAt: DateTime
+}
+
+type TypeAggregation {
+  type: String!
+  avg: Float
+  min: Float
+  max: Float
+  count: Int!
+  latestValue: Float
+  latestAt: DateTime
+}
+
 type PageInfo {
   hasNextPage: Boolean!
   endCursor: String
@@ -305,6 +375,8 @@ Subscriptions не обязательны (live через SignalR); при не
 | GET | `/ready` | Readiness (PostgreSQL reachable) |
 | GET | `/api/readings` | Optional paged JSON list (query: location, type, from, to) |
 | GET | `/api/readings/latest` | Latest per location+type |
+| GET | `/api/aggregations/by-location` | Query: `from`, `to`, optional `type` |
+| GET | `/api/aggregations/by-type` | Query: `from`, `to`, optional `location` |
 
 **Notification Service**
 
@@ -407,7 +479,7 @@ Prometheus/Grafana/OTel — **out of scope** (§1.3). Фокус: structured log
 1. Ingestor: WeakApp возвращает 503 → retry; после порога circuit breaker open, сервис не падает.
 2. Processor: повторное сообщение с тем же `(SourceId, IngestedAt)` не создаёт дубликат строки.
 3. GraphQL: `readings` с filter по location/type + pagination возвращает ожидаемый набор.
-4. GraphQL: `aggregationsByTime` совпадает с эталонным SQL на фикстуре данных.
+4. GraphQL: `aggregationsByTime`, `aggregationsByLocation`, `aggregationsByType` совпадают с эталонным SQL на фикстуре данных.
 5. Notification: после POST `/internal/readings` подключённый SignalR client получает `ReadingUpdated`.
 6. Compose: все `/health` и `/ready` green после `docker compose up`.
 
@@ -419,7 +491,7 @@ Prometheus/Grafana/OTel — **out of scope** (§1.3). Фокус: structured log
 |---|---|---|---|
 | WeakApp меняет JSON `/meters` без документации | Medium | High | `rawPayload` в сообщении; интеграционный тест на sample; быстрый fix маппера в Ingestor |
 | Очередь растёт быстрее, чем Processor пишет в БД | Low | Medium | Prefetch/concurrency limit; мониторинг depth в RabbitMQ UI; масштаб Processor (out of scope multi-instance) |
-| Дубликаты или пропуски при retry Ingestor | Medium | Medium | Idempotent key `(SourceId, IngestedAt)`; явная dedupe в Processor |
+| Дубликаты или пропуски при retry Ingestor / RabbitMQ | Medium | Medium | **`SourceId`** (§4.3: id из WeakApp → `{location}:{type}:{recordedAt}` → hash); unique `(SourceId, IngestedAt)`; manual ACK после commit (§4.4) |
 | GraphQL N+1 / тяжёлые aggregations | Medium | Medium | EF projections, индексы §5; лимиты page size и time range на query |
 | Scope creep (OTel, Sonar, polyglot) | High | Medium | Жёсткий §1.3 out of scope; бонусы только после green MVP |
 | Notification недоступен — нет live UI | Medium | Low | Данные в БД; UI может fallback на polling GraphQL (degraded mode) |

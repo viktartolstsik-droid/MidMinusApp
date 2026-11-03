@@ -135,3 +135,7 @@ IP берётся из `HttpContext.Connection.RemoteIpAddress`. Если его
 - Образ нужно собирать из репозитория WeakApp. Готового тега в workflow нет.
 - Клиентский таймаут короче ~35 с будет обрывать редкий, но штатный медленный ответ.
 - Интервал опроса около 1–2 с упирается в 429. Десять секунд между опросами — 4 запроса за окно 40 с и оставляет запас, если часть запросов повторяется.
+
+## Черновик маппинга
+
+Черновик, не согласован. В сообщения MidMinusApp попадает только успешный `GET /meters`. Каждый элемент массива становится одним или несколькими `RawReadingMessage`: `name` пишется в `location`; у `energy` — `type=energy` и `value=payload.energy`; у `motion` — `type=motion`, а `value` равен `1` или `0` по `payload.motionDetected`; `air_quality` разворачивается в три сообщения с общим `location` и типами `air_quality.co2`, `air_quality.pm25`, `air_quality.humidity`, потому что у нас на строку одно число, а в payload их три. `unit` везде пустой: единиц в API нет. `ingestedAt` — UTC-время этого HTTP-ответа, одно на все сообщения poll. `rawPayload` — исходный элемент. `sourceId` предлагается как `{location}:{type}` уже после разложения (`Kitchen:energy`, `Office:air_quality.pm25`): своего id и времени у WeakApp нет, а ключ от `value` менялся бы вместе с показанием. Ответ `[]` — успешный poll без сообщений. HTTP 200 с телом не-массивом в очередь не кладётся. `/health`, `/healthz`, `/.well-known/health` и `/weatherforecast` в `RawReadingMessage` не превращаются.

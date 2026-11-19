@@ -3,6 +3,7 @@ using Microsoft.Extensions.Options;
 namespace Ingestor;
 
 public sealed class PollingWorker(
+    IServiceScopeFactory scopeFactory,
     IOptions<PollingOptions> pollingOptions,
     IOptions<WeakAppOptions> weakAppOptions,
     ILogger<PollingWorker> logger) : BackgroundService
@@ -22,8 +23,39 @@ public sealed class PollingWorker(
         do
         {
             cycle++;
-            logger.LogInformation("Poll cycle {Cycle}: stub, no request sent", cycle);
+            await PollAsync(cycle, stoppingToken);
         }
         while (await timer.WaitForNextTickAsync(stoppingToken));
+    }
+
+    private async Task PollAsync(long cycle, CancellationToken stoppingToken)
+    {
+        try
+        {
+            // Typed HttpClient is resolved per cycle so the factory can rotate its handler.
+            using var scope = scopeFactory.CreateScope();
+            var client = scope.ServiceProvider.GetRequiredService<WeakAppClient>();
+
+            var result = await client.GetMetersAsync(stoppingToken);
+
+            if (result.IsSuccess)
+            {
+                logger.LogInformation("Poll cycle {Cycle}: received {MeterCount} meters", cycle, result.Meters.Count);
+            }
+            else
+            {
+                logger.LogWarning(
+                    "Poll cycle {Cycle} failed: {Outcome}, HTTP status {StatusCode}",
+                    cycle, result.Outcome, result.StatusCode);
+            }
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Poll cycle {Cycle} failed unexpectedly", cycle);
+        }
     }
 }

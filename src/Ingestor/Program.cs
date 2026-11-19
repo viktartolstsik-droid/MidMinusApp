@@ -14,6 +14,7 @@ builder.Services.AddOptions<PollingOptions>()
     .Validate(o => o.Interval > TimeSpan.Zero, "Polling:Interval must be positive.")
     .ValidateOnStart();
 
+builder.Services.AddWeakAppClient();
 builder.Services.AddHostedService<PollingWorker>();
 builder.Services.AddHealthChecks();
 

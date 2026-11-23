@@ -14,7 +14,17 @@ public static class ReadingMapper
 
         foreach (var meter in meters)
         {
-            var mapped = MapMeter(meter, ingestedAt);
+            IReadOnlyList<RawReadingMessage> mapped;
+            try
+            {
+                mapped = MapMeter(meter, ingestedAt);
+            }
+            catch (Exception)
+            {
+                // MapMeter is written not to throw on any JSON; this keeps a future slip from costing the whole poll.
+                mapped = [];
+            }
+
             if (mapped.Count == 0)
             {
                 skipped++;

@@ -94,6 +94,52 @@ public sealed class ReadingMapperTests
         Assert.Equal(1, result.SkippedMeters);
     }
 
+    [Theory]
+    [InlineData("""{ "type": "energy", "name": "Office", "payload": { "energy": 1e400 } }""")]
+    [InlineData("""{ "type": "energy", "name": "Office", "payload": { "energy": -1e400 } }""")]
+    [InlineData("""{ "type": "energy", "name": "Office", "payload": { "energy": 79228162514264337593543950336 } }""")]
+    [InlineData("""{ "type": "air_quality", "name": "Office", "payload": { "co2": 1e309, "pm25": 1, "humidity": 1 } }""")]
+    [InlineData("""{ "type": 5, "name": ["Office"], "payload": "x" }""")]
+    [InlineData("\"just a string\"")]
+    [InlineData("42")]
+    public void ExtremeMeterInTheMiddle_IsSkippedAndKeepsTheRest(string json)
+    {
+        var meters = new[]
+        {
+            Parse("""{ "type": "energy", "name": "Kitchen", "payload": { "energy": 1 } }"""),
+            Parse(json),
+            Parse("""{ "type": "motion", "name": "Kitchen", "payload": { "motionDetected": true } }"""),
+        };
+
+        var result = ReadingMapper.Map(meters, IngestedAt);
+
+        Assert.Equal(["Kitchen:energy", "Kitchen:motion"], result.Messages.Select(m => m.SourceId));
+        Assert.Equal(1, result.SkippedMeters);
+    }
+
+    [Fact]
+    public void DefaultElement_IsSkipped()
+    {
+        var result = ReadingMapper.Map([default], IngestedAt);
+
+        Assert.Empty(result.Messages);
+        Assert.Equal(1, result.SkippedMeters);
+    }
+
+    [Fact]
+    public void DuplicateKeys_DoNotBreakThePoll()
+    {
+        var meters = new[]
+        {
+            Parse("""{ "type": "energy", "name": "Kitchen", "name": "Office", "payload": { "energy": 1, "energy": 2 } }"""),
+            Parse("""{ "type": "motion", "name": "Kitchen", "payload": { "motionDetected": true } }"""),
+        };
+
+        var result = ReadingMapper.Map(meters, IngestedAt);
+
+        Assert.Contains(result.Messages, m => m.SourceId == "Kitchen:motion");
+    }
+
     [Fact]
     public void FullSnapshot_GivesThirtyMessagesWithOneIngestedAt()
     {

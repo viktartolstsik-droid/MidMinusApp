@@ -4,6 +4,7 @@ namespace Ingestor;
 
 public sealed class PollingWorker(
     IServiceScopeFactory scopeFactory,
+    IReadingPublisher publisher,
     IOptions<PollingOptions> pollingOptions,
     IOptions<WeakAppOptions> weakAppOptions,
     ILogger<PollingWorker> logger) : BackgroundService
@@ -23,12 +24,12 @@ public sealed class PollingWorker(
         do
         {
             cycle++;
-            await PollAsync(cycle, stoppingToken);
+            await PollOnceAsync(cycle, stoppingToken);
         }
         while (await timer.WaitForNextTickAsync(stoppingToken));
     }
 
-    private async Task PollAsync(long cycle, CancellationToken stoppingToken)
+    internal async Task PollOnceAsync(long cycle, CancellationToken stoppingToken)
     {
         try
         {
@@ -38,16 +39,34 @@ public sealed class PollingWorker(
 
             var result = await client.GetMetersAsync(stoppingToken);
 
-            if (result.IsSuccess)
-            {
-                logger.LogInformation("Poll cycle {Cycle}: received {MeterCount} meters", cycle, result.Meters.Count);
-            }
-            else
+            if (!result.IsSuccess)
             {
                 logger.LogWarning(
                     "Poll cycle {Cycle} failed: {Outcome}, HTTP status {StatusCode}",
                     cycle, result.Outcome, result.StatusCode);
+                return;
             }
+
+            var mapped = ReadingMapper.Map(result.Meters, DateTimeOffset.UtcNow);
+
+            if (mapped.Messages.Count > 0)
+            {
+                try
+                {
+                    await publisher.PublishAsync(mapped.Messages, stoppingToken);
+                }
+                catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
+                {
+                    logger.LogError(
+                        ex, "Poll cycle {Cycle}: publishing {MessageCount} messages failed, next cycle retries",
+                        cycle, mapped.Messages.Count);
+                    return;
+                }
+            }
+
+            logger.LogInformation(
+                "Poll cycle {Cycle}: received {MeterCount} meters, skipped {SkippedCount}, published {PublishedCount} messages",
+                cycle, result.Meters.Count, mapped.SkippedMeters, mapped.Messages.Count);
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {

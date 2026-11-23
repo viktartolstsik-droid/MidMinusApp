@@ -91,7 +91,7 @@
 
 - **Responsibility:** Периодически опрашивать WeakApp, маппить ответ в внутреннее сообщение, публиковать в очередь; не обращаться к PostgreSQL.
 - **Runtime:** ASP.NET Core host + `BackgroundService` (polling loop).
-- **Key libraries:** `HttpClient`, **Polly** (retry, circuit breaker), **RabbitMQ.Client** или **MassTransit**, **Serilog**.
+- **Key libraries:** `HttpClient`, **Polly** (retry, circuit breaker), **RabbitMQ.Client** (§13 п. 2), **Serilog**.
 - **Resilience / config:** интервал poll (например 10s), `X-Api-Key`, retry с exponential backoff, circuit breaker при серии 5xx/timeout.
 - **Inputs:** WeakApp HTTP (`GET /meters`).
 - **Output:** AMQP message `RawReadingMessage` → exchange/queue ingest (см. §4).
@@ -100,7 +100,7 @@
 
 - **Responsibility:** Потреблять сообщения из очереди, валидировать, дедуплицировать, записывать в PostgreSQL, уведомлять Notification Service о новых показаниях.
 - **Runtime:** ASP.NET Core Worker / hosted consumer.
-- **Key libraries:** **RabbitMQ.Client** / MassTransit, **EF Core** + Npgsql, **Serilog**, `HttpClient` (вызов Notification).
+- **Key libraries:** **RabbitMQ.Client** (§13 п. 2), **EF Core** + Npgsql, **Serilog**, `HttpClient` (вызов Notification).
 - **Resilience / config:** idempotent insert по `(SourceId, IngestedAt)`; dead-letter / retry policy для poison messages; **RabbitMQ manual ACK** (см. §4.3).
 - **Inputs:** RabbitMQ consume.
 - **Outputs:** SQL INSERT/UPSERT; HTTP POST к Notification (payload «reading persisted»).
@@ -513,7 +513,7 @@ Prometheus/Grafana/OTel — **out of scope** (§1.3). Фокус: structured log
 ## 13. Open Decisions
 
 1. **Точная схема WeakApp `/meters`** — зафиксировать после первого `curl`/compose; может потребоваться правка §4.1 и маппера.
-2. **MassTransit vs raw RabbitMQ.Client** — MassTransit ускоряет consumer/hosting; raw проще для учебного объёма. *Склонение:* MassTransit, если не утяжеляет compose.
+2. **MassTransit vs raw RabbitMQ.Client** — **решено: RabbitMQ.Client 7.x** (`feature/m1-rabbit-publish`). Причины: §4.4 описан в терминах AMQP (manual ACK, `BasicNack`, DLQ `ingestor.raw.dlq`), которые MassTransit прячет за своей топологией и именами очередей; MassTransit кладёт сообщение в свой envelope, а в очереди нужен плоский `RawReadingMessage` из §4.1; v9 MassTransit платная. Очередь — durable `ingestor.raw` в default exchange, сообщения persistent, publisher confirms. Имя очереди и JSON-настройки лежат в `src/Contracts`, Processor подключается так же.
 3. **Shared `src/Contracts` project** — один NuGet-проект для DTO сообщений между Ingestor/Processor. *Склонение:* да, monorepo.
 4. **GraphQL Playground / Swagger** — бонус D3S1; включать после M3 или отложить. *Склонение:* Hot Chocolate Banana Cake Pop в dev-only.
 5. **Структура папок `src/`** — имена проектов (`GraphQL` vs `Gateway`) — выровнять с CI path filters §7.3 при создании репозитория кода.

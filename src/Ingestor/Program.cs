@@ -1,4 +1,5 @@
 using Ingestor;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -14,12 +15,26 @@ builder.Services.AddOptions<PollingOptions>()
     .Validate(o => o.Interval > TimeSpan.Zero, "Polling:Interval must be positive.")
     .ValidateOnStart();
 
+builder.Services.AddOptions<RabbitMqOptions>()
+    .Bind(builder.Configuration.GetSection(RabbitMqOptions.SectionName))
+    .Validate(o => !string.IsNullOrWhiteSpace(o.Host), "RabbitMQ:Host is required.")
+    .Validate(o => !string.IsNullOrWhiteSpace(o.UserName), "RabbitMQ:UserName is required.")
+    .Validate(o => !string.IsNullOrWhiteSpace(o.Password), "RabbitMQ:Password is required.")
+    .Validate(o => !string.IsNullOrWhiteSpace(o.Queue), "RabbitMQ:Queue is required.")
+    .Validate(o => o.ConnectTimeout > TimeSpan.Zero, "RabbitMQ:ConnectTimeout must be positive.")
+    .ValidateOnStart();
+
 builder.Services.AddWeakAppClient();
+builder.Services.AddRabbitMqPublisher();
 builder.Services.AddHostedService<PollingWorker>();
-builder.Services.AddHealthChecks();
 
 var app = builder.Build();
 
-app.MapHealthChecks("/health");
+// Liveness must not depend on RabbitMQ, otherwise a broker outage restarts a healthy poller.
+app.MapHealthChecks("/health", new HealthCheckOptions { Predicate = _ => false });
+app.MapHealthChecks("/ready", new HealthCheckOptions
+{
+    Predicate = check => check.Tags.Contains(RabbitMqRegistration.ReadyTag),
+});
 
 app.Run();

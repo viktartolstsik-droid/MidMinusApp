@@ -69,8 +69,13 @@ services:
     environment:
       WeakApp__BaseUrl: http://weakapp:8080
       WeakApp__ApiKey: ${WEAKAPP_API_KEY:?set WEAKAPP_API_KEY in .env}
+      RabbitMQ__Host: rabbitmq
+      RabbitMQ__UserName: ${RABBITMQ_USER:?set RABBITMQ_USER in .env}
+      RabbitMQ__Password: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env}
     depends_on:
       weakapp:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
     healthcheck:
       # The aspnet base image ships without curl/wget.

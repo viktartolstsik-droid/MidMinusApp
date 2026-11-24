@@ -73,6 +73,38 @@ public sealed class RabbitMqPublisherTests(RabbitMqFixture rabbit) : IClassFixtu
     }
 
     [Fact]
+    public async Task RejectedMessage_GoesToDeadLetterQueue()
+    {
+        var queue = $"test.{Guid.NewGuid():N}";
+        var message = Message("Kitchen");
+        await using (var publisher = CreatePublisher(rabbit.Container.Hostname, rabbit.Container.GetMappedPublicPort(5672), queue))
+        {
+            await publisher.PublishAsync([message], CancellationToken.None);
+        }
+
+        await using var connection = await ConnectAsync();
+        await using var channel = await connection.CreateChannelAsync();
+        var delivery = await channel.BasicGetAsync(queue, autoAck: false);
+        Assert.NotNull(delivery);
+        await channel.BasicRejectAsync(delivery.DeliveryTag, requeue: false);
+
+        var deadLetterQueue = RawReadingTransport.DeadLetterQueueFor(queue);
+        BasicGetResult? deadLetter = null;
+        for (var attempt = 0; attempt < 20 && deadLetter is null; attempt++)
+        {
+            deadLetter = await channel.BasicGetAsync(deadLetterQueue, autoAck: true);
+            if (deadLetter is null)
+            {
+                await Task.Delay(100);
+            }
+        }
+
+        Assert.NotNull(deadLetter);
+        Assert.Equal(message.MessageId.ToString(), deadLetter.BasicProperties.MessageId);
+        Assert.Equal(0u, await channel.MessageCountAsync(queue));
+    }
+
+    [Fact]
     public async Task Publish_ReconnectsAfterBrokerClosedTheConnection()
     {
         var queue = $"test.{Guid.NewGuid():N}";

@@ -106,11 +106,18 @@ public sealed class RabbitMqPublisher(IOptions<RabbitMqOptions> options, ILogger
                 new CreateChannelOptions(publisherConfirmationsEnabled: true, publisherConfirmationTrackingEnabled: true),
                 timeout.Token);
             await _channel.QueueDeclareAsync(
-                queue: _options.Queue,
+                queue: RawReadingTransport.DeadLetterQueueFor(_options.Queue),
                 durable: true,
                 exclusive: false,
                 autoDelete: false,
                 arguments: null,
+                cancellationToken: timeout.Token);
+            await _channel.QueueDeclareAsync(
+                queue: _options.Queue,
+                durable: true,
+                exclusive: false,
+                autoDelete: false,
+                arguments: RawReadingTransport.QueueArguments(_options.Queue),
                 cancellationToken: timeout.Token);
         }
         catch
@@ -120,8 +127,8 @@ public sealed class RabbitMqPublisher(IOptions<RabbitMqOptions> options, ILogger
         }
 
         logger.LogInformation(
-            "Connected to RabbitMQ at {Host}:{Port}, queue {Queue}",
-            _options.Host, _options.Port, _options.Queue);
+            "Connected to RabbitMQ at {Host}:{Port}, queue {Queue}, dead-letter queue {DeadLetterQueue}",
+            _options.Host, _options.Port, _options.Queue, RawReadingTransport.DeadLetterQueueFor(_options.Queue));
         return _channel;
     }
 

@@ -67,9 +67,17 @@ public sealed class RabbitMqPublisherTests(RabbitMqFixture rabbit) : IClassFixtu
         var roundTrip = JsonSerializer.Deserialize<RawReadingMessage>(delivery.Body.Span, RawReadingTransport.JsonOptions);
         Assert.Equal(message.SourceId, roundTrip?.SourceId);
 
-        // Redeclaring with different durability is refused only if the queue really is durable.
+        var deadLetterQueue = RawReadingTransport.DeadLetterQueueFor(queue);
+
+        // The Processor declares the queue from the same contract; RabbitMQ accepts that only if the arguments match exactly.
+        await DeclareAsync(connection, queue, durable: true, RawReadingTransport.QueueArguments(queue));
+        await DeclareAsync(connection, deadLetterQueue, durable: true, arguments: null);
+
+        // Only durability differs here, so the refusal proves the queues are durable.
         await Assert.ThrowsAsync<OperationInterruptedException>(() =>
-            channel.QueueDeclareAsync(queue, durable: false, exclusive: false, autoDelete: false));
+            DeclareAsync(connection, queue, durable: false, RawReadingTransport.QueueArguments(queue)));
+        await Assert.ThrowsAsync<OperationInterruptedException>(() =>
+            DeclareAsync(connection, deadLetterQueue, durable: false, arguments: null));
     }
 
     [Fact]
@@ -159,6 +167,13 @@ public sealed class RabbitMqPublisherTests(RabbitMqFixture rabbit) : IClassFixtu
 
     private Task<IConnection> ConnectAsync() =>
         new ConnectionFactory { Uri = new Uri(rabbit.Container.GetConnectionString()) }.CreateConnectionAsync();
+
+    // A refused declare closes the channel, so each declare gets its own.
+    private static async Task DeclareAsync(IConnection connection, string queue, bool durable, IDictionary<string, object?>? arguments)
+    {
+        await using var channel = await connection.CreateChannelAsync();
+        await channel.QueueDeclareAsync(queue, durable, exclusive: false, autoDelete: false, arguments);
+    }
 
     private static RawReadingMessage Message(string location) =>
         new(Guid.NewGuid(), IngestedAt, $"{location}:energy", location, "energy", 1.5m, null, null);

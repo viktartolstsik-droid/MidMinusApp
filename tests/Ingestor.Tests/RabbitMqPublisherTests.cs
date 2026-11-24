@@ -73,11 +73,41 @@ public sealed class RabbitMqPublisherTests(RabbitMqFixture rabbit) : IClassFixtu
         await DeclareAsync(connection, queue, durable: true, RawReadingTransport.QueueArguments(queue));
         await DeclareAsync(connection, deadLetterQueue, durable: true, arguments: null);
 
-        // Only durability differs here, so the refusal proves the queues are durable.
+        // A quorum queue is always durable; a classic redeclare is refused only if the queue really is quorum.
+        var classic = RawReadingTransport.QueueArguments(queue);
+        classic.Remove("x-queue-type");
+        classic.Remove("x-delivery-limit");
         await Assert.ThrowsAsync<OperationInterruptedException>(() =>
-            DeclareAsync(connection, queue, durable: false, RawReadingTransport.QueueArguments(queue)));
+            DeclareAsync(connection, queue, durable: true, classic));
+
+        // Only durability differs here, so the refusal proves the dead-letter queue is durable.
         await Assert.ThrowsAsync<OperationInterruptedException>(() =>
             DeclareAsync(connection, deadLetterQueue, durable: false, arguments: null));
+    }
+
+    [Fact]
+    public async Task RequeuedPastDeliveryLimit_GoesToDeadLetterQueue()
+    {
+        var queue = $"test.{Guid.NewGuid():N}";
+        var message = Message("Kitchen");
+        await using (var publisher = CreatePublisher(rabbit.Container.Hostname, rabbit.Container.GetMappedPublicPort(5672), queue))
+        {
+            await publisher.PublishAsync([message], CancellationToken.None);
+        }
+
+        await using var connection = await ConnectAsync();
+        await using var channel = await connection.CreateChannelAsync();
+
+        var deliveries = 0;
+        while (deliveries < 20 && await channel.BasicGetAsync(queue, autoAck: false) is { } delivery)
+        {
+            deliveries++;
+            await channel.BasicNackAsync(delivery.DeliveryTag, multiple: false, requeue: true);
+        }
+
+        Assert.Equal(RawReadingTransport.DeliveryLimit + 1, deliveries);
+        var deadLetter = await WaitForDeadLetterAsync(channel, queue);
+        Assert.Equal(message.MessageId.ToString(), deadLetter.BasicProperties.MessageId);
     }
 
     [Fact]
@@ -96,18 +126,7 @@ public sealed class RabbitMqPublisherTests(RabbitMqFixture rabbit) : IClassFixtu
         Assert.NotNull(delivery);
         await channel.BasicRejectAsync(delivery.DeliveryTag, requeue: false);
 
-        var deadLetterQueue = RawReadingTransport.DeadLetterQueueFor(queue);
-        BasicGetResult? deadLetter = null;
-        for (var attempt = 0; attempt < 20 && deadLetter is null; attempt++)
-        {
-            deadLetter = await channel.BasicGetAsync(deadLetterQueue, autoAck: true);
-            if (deadLetter is null)
-            {
-                await Task.Delay(100);
-            }
-        }
-
-        Assert.NotNull(deadLetter);
+        var deadLetter = await WaitForDeadLetterAsync(channel, queue);
         Assert.Equal(message.MessageId.ToString(), deadLetter.BasicProperties.MessageId);
         Assert.Equal(0u, await channel.MessageCountAsync(queue));
     }
@@ -167,6 +186,23 @@ public sealed class RabbitMqPublisherTests(RabbitMqFixture rabbit) : IClassFixtu
 
     private Task<IConnection> ConnectAsync() =>
         new ConnectionFactory { Uri = new Uri(rabbit.Container.GetConnectionString()) }.CreateConnectionAsync();
+
+    // Dead-lettering is asynchronous, so the message may reach the dead-letter queue a moment later.
+    private static async Task<BasicGetResult> WaitForDeadLetterAsync(IChannel channel, string queue)
+    {
+        var deadLetterQueue = RawReadingTransport.DeadLetterQueueFor(queue);
+        for (var attempt = 0; attempt < 20; attempt++)
+        {
+            if (await channel.BasicGetAsync(deadLetterQueue, autoAck: true) is { } deadLetter)
+            {
+                return deadLetter;
+            }
+
+            await Task.Delay(100);
+        }
+
+        throw new TimeoutException($"No message reached {deadLetterQueue}.");
+    }
 
     // A refused declare closes the channel, so each declare gets its own.
     private static async Task DeclareAsync(IConnection connection, string queue, bool durable, IDictionary<string, object?>? arguments)
